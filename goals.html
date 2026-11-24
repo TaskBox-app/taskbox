@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SECRET ARCHIVE</title>
+  <link rel="stylesheet" href="goals.css" />
+  <script src="auth.js"></script>
+  <script>
+    // Клиентская проверка доступа (та же, что и раньше — не менялась).
+    // Выполняется синхронно до отрисовки страницы, чтобы простой переход
+    // по URL не показывал содержимое архива без ввода кода в этой сессии.
+    // Это НЕ полноценная защита — подробности в README.md.
+    if (typeof isGoalsUnlocked !== "function" || !isGoalsUnlocked()) {
+      window.location.replace("index.html");
+    }
+  </script>
+</head>
+<body>
+  <button type="button" class="logout-corner-btn" id="logout-btn" title="Выйти из SECRET ARCHIVE" aria-label="Выйти из SECRET ARCHIVE">×</button>
+
+  <div class="archive-app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-icon">🗄</span>
+        <span class="brand-title">SECRET ARCHIVE</span>
+      </div>
+
+      <nav class="nav">
+        <button type="button" class="nav-item active" data-view="home">🏠 Главная</button>
+        <button type="button" class="nav-item" data-view="documents">📄 Документы</button>
+        <button type="button" class="nav-item" data-view="files">🗂 Файлы</button>
+      </nav>
+
+      <div class="folders-section">
+        <div class="folders-header">
+          <span>Папки</span>
+          <button type="button" class="folder-add-btn" id="new-folder-btn" title="Новая папка">+</button>
+        </div>
+        <div class="folders-list" id="folders-list"></div>
+      </div>
+
+      <div class="sidebar-actions">
+        <button type="button" class="sidebar-action-btn" id="export-btn" title="Скачать зашифрованный файл-бэкап со всеми данными">⬇ Экспорт</button>
+        <button type="button" class="sidebar-action-btn" id="import-btn" title="Загрузить данные из файла-бэкапа">⬆ Импорт</button>
+        <input type="file" id="import-file-input" accept="application/json,.json" hidden />
+      </div>
+    </aside>
+
+    <main class="main">
+      <!-- Главная -->
+      <section class="view" id="view-home">
+        <h1 class="view-title">SECRET ARCHIVE</h1>
+        <p class="view-subtitle">Закрытое хранилище документов и файлов</p>
+
+        <div class="stats-row">
+          <div class="stat-card">
+            <span class="stat-value" id="stat-docs">0</span>
+            <span class="stat-label">документов</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value" id="stat-files">0</span>
+            <span class="stat-label">файлов</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value" id="stat-folders">0</span>
+            <span class="stat-label">папок</span>
+          </div>
+        </div>
+
+        <h2 class="section-title">Недавно добавленные документы</h2>
+        <div class="recent-list" id="recent-list"></div>
+        <p class="empty-hint" id="recent-empty" hidden>Пока пусто. Создай первый документ во вкладке «Документы».</p>
+      </section>
+
+      <!-- Документы -->
+      <section class="view" id="view-documents" hidden>
+        <div class="view-header">
+          <h1 class="view-title">Документы</h1>
+          <button type="button" class="primary-btn" id="new-doc-btn">+ Новый документ</button>
+        </div>
+
+        <div class="toolbar">
+          <input type="search" id="doc-search" class="search-input" placeholder="Поиск по документам..." />
+          <span class="filter-chip" id="doc-folder-chip" hidden>
+            <span id="doc-folder-chip-label"></span>
+            <button type="button" id="doc-folder-chip-clear" aria-label="Снять фильтр">×</button>
+          </span>
+        </div>
+
+        <div class="docs-grid" id="docs-grid"></div>
+        <p class="empty-hint" id="docs-empty" hidden>Документов не найдено.</p>
+      </section>
+
+      <!-- Файлы -->
+      <section class="view" id="view-files" hidden>
+        <div class="view-header">
+          <h1 class="view-title">Файлы</h1>
+          <button type="button" class="primary-btn" id="upload-file-btn">+ Загрузить файл</button>
+          <input type="file" id="file-input" accept=".pdf,.docx,.txt,image/*" hidden />
+        </div>
+
+        <div class="toolbar">
+          <input type="search" id="file-search" class="search-input" placeholder="Поиск по файлам..." />
+          <span class="filter-chip" id="file-folder-chip" hidden>
+            <span id="file-folder-chip-label"></span>
+            <button type="button" id="file-folder-chip-clear" aria-label="Снять фильтр">×</button>
+          </span>
+        </div>
+
+        <div class="files-grid" id="files-grid"></div>
+        <p class="empty-hint" id="files-empty" hidden>Файлов не найдено.</p>
+      </section>
+    </main>
+  </div>
+
+  <!-- Модалка документа -->
+  <div class="modal-overlay" id="doc-modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="doc-modal-title">
+      <button type="button" class="modal-close" id="doc-modal-close" aria-label="Закрыть">×</button>
+      <h2 id="doc-modal-title">Новый документ</h2>
+      <form id="doc-form">
+        <label class="field">
+          <span>Название</span>
+          <input type="text" id="doc-title-input" maxlength="150" required />
+        </label>
+        <label class="field">
+          <span>Содержание</span>
+          <textarea id="doc-content-input" rows="8" maxlength="20000"></textarea>
+        </label>
+        <label class="field">
+          <span>Папка</span>
+          <select id="doc-folder-select"></select>
+        </label>
+        <button type="submit" class="save-btn">Сохранить</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Модалка новой папки -->
+  <div class="modal-overlay" id="folder-modal-overlay" hidden>
+    <div class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="folder-modal-title">
+      <button type="button" class="modal-close" id="folder-modal-close" aria-label="Закрыть">×</button>
+      <h2 id="folder-modal-title">Новая папка</h2>
+      <form id="folder-form">
+        <label class="field">
+          <span>Название папки</span>
+          <input type="text" id="folder-name-input" maxlength="60" required />
+        </label>
+        <button type="submit" class="save-btn">Создать</button>
+      </form>
+    </div>
+  </div>
+
+  <script src="goals.js"></script>
+</body>
+</html>

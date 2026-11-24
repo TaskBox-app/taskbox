@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TaskBox — Менеджер задач</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1>📋 TaskBox</h1>
+      <p class="subtitle">Твои задачи, просто и красиво</p>
+    </header>
+
+    <form class="task-form" id="task-form">
+      <input
+        type="text"
+        id="task-input"
+        class="task-input"
+        placeholder="Что нужно сделать?"
+        autocomplete="off"
+        maxlength="200"
+      />
+      <button type="submit" class="add-btn">Добавить</button>
+    </form>
+
+    <div class="stats">
+      <span id="total-count">Всего: 0</span>
+      <span id="active-count">Активных: 0</span>
+      <span id="completed-count">Выполнено: 0</span>
+    </div>
+
+    <div class="filters">
+      <button class="filter-btn active" data-filter="all">Все</button>
+      <button class="filter-btn" data-filter="active">Активные</button>
+      <button class="filter-btn" data-filter="completed">Выполненные</button>
+    </div>
+
+    <ul class="task-list" id="task-list"></ul>
+
+    <p class="empty-state" id="empty-state">Задач пока нет. Добавь первую! ✨</p>
+  </div>
+
+  <button type="button" class="secret-dot" id="secret-dot" aria-label="Дополнительный раздел"></button>
+
+  <div class="secret-overlay" id="secret-overlay" hidden>
+    <div class="secret-modal" role="dialog" aria-modal="true" aria-labelledby="secret-title">
+      <button type="button" class="secret-close" id="secret-close" aria-label="Закрыть">×</button>
+      <h2 id="secret-title">Код доступа</h2>
+      <form id="secret-form">
+        <input
+          type="password"
+          id="secret-code-input"
+          class="secret-input"
+          placeholder="Введите код"
+          autocomplete="off"
+        />
+        <button type="submit" class="secret-submit">Войти</button>
+      </form>
+      <p class="secret-error" id="secret-error" hidden>Неверный код. Попробуйте ещё раз.</p>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+  <script src="auth.js"></script>
+  <script src="secret.js"></script>
+</body>
+</html>
