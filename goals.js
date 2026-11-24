@@ -1,24 +1,32 @@
 // --- SECRET ARCHIVE: документы, файлы и папки ---
 //
-// Хранилище: только localStorage (бэкенда в проекте нет — это статический
-// сайт без сервера). Все данные остаются только в этом браузере.
+// Хранилище: IndexedDB (с автоматической одноразовой миграцией из старого
+// LocalStorage — см. раздел «Хранилище» ниже). Бэкенда в проекте нет — это
+// статический сайт без сервера, все данные остаются только в этом браузере.
 //
-// Содержимое документов и файлов шифруется (AES-GCM, ключ из auth.js —
-// см. getArchiveEncryptionKey) перед записью в localStorage. Это защищает от
-// самого простого способа подглядеть данные: прочитать localStorage через
-// консоль разработчика, не вводя код доступа. Метаданные (даты, размер,
-// id папки) не шифруются — они нужны для сортировки и фильтрации и не
-// считаются секретными.
+// Содержимое документов и файлов шифруется (AES-GCM-256, ключ через PBKDF2 —
+// см. auth.js: getArchiveEncryptionKey) перед записью в хранилище. Это
+// защищает от самого простого способа подглядеть данные: прочитать
+// хранилище через консоль разработчика, не вводя код доступа. Метаданные
+// (даты, размер, id папки/родителя) не шифруются — они нужны для сортировки
+// и фильтрации и не считаются секретными.
 // Подробности и честные ограничения — в README.md.
 
 const SA_DOCS_KEY = "secret-archive-documents";
 const SA_FILES_KEY = "secret-archive-files";
 const SA_FOLDERS_KEY = "secret-archive-folders";
+const SA_STORAGE_MODE_KEY = "secret-archive-storage-mode";
+const SA_MIGRATION_BACKUP_AT_KEY = "secret-archive-migration-backup-at";
+
+const IDB_NAME = "secret-archive-db";
+const IDB_VERSION = 1;
+const IDB_STORES = ["documents", "files", "folders"];
 
 // Старый раздел Goals убран из проекта — подчищаем его данные, если остались.
 localStorage.removeItem("taskbox-goals");
 
-const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2 МБ — с учётом двойного base64 (файл + шифрование)
+const MAX_FILE_SIZE_LOCALSTORAGE = 2 * 1024 * 1024; // 2 МБ — старый лимит для LocalStorage
+const MAX_FILE_SIZE_INDEXEDDB = 25 * 1024 * 1024; // 25 МБ — IndexedDB на порядки просторнее
 
 // --- Состояние (заполняется асинхронно в init(), после расшифровки) ---
 
@@ -30,6 +38,157 @@ let encryptionKey = null;
 let currentView = "home";
 let activeFolderId = null; // null = без фильтра по папке
 let editingDocId = null;
+let editingFolderId = null; // null = создаём новую папку, иначе — переименовываем
+let creatingFolderParentId = null; // id родителя для новой папки (null = корень)
+const expandedFolderIds = new Set(); // какие папки раскрыты в дереве (только в памяти)
+
+// --- Хранилище: IndexedDB с запасным вариантом на LocalStorage ---
+//
+// storageMode определяется один раз при запуске:
+// - "indexeddb", если IndexedDB доступен в этом браузере (обычный случай);
+// - "localStorage", если IndexedDB недоступен (очень старый браузер или
+//   режим приватного просмотра в некоторых версиях Safari, где IndexedDB
+//   может быть заблокирован) — тогда архив продолжает работать как раньше,
+//   без миграции.
+
+let storageMode = "localStorage";
+let idbInstance = null;
+
+function openDatabase() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error("IndexedDB недоступен в этом браузере"));
+      return;
+    }
+    const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      IDB_STORES.forEach((storeName) => {
+        if (!db.objectStoreNames.contains(storeName)) {
+          db.createObjectStore(storeName, { keyPath: "id" });
+        }
+      });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbGetAll(db, storeName) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const store = tx.objectStore(storeName);
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Полностью заменяет содержимое стора текущим состоянием массива в памяти
+// (аналог "сохранить всё заново", как раньше делал localStorage.setItem).
+function idbReplaceAll(db, storeName, items) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    store.clear();
+    items.forEach((item) => store.put(item));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function loadRawArray(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : [];
+  } catch (error) {
+    console.error(`Не удалось прочитать ${key} из LocalStorage:`, error);
+    return [];
+  }
+}
+
+// --- Миграция из LocalStorage в IndexedDB (выполняется один раз) ---
+//
+// Шаги, в порядке, который требует задание:
+// 1. Снимаем резервную копию текущих данных LocalStorage под отдельными
+//    ключами (*__backup) — на случай, если что-то пойдёт не так.
+// 2. Переносим данные в IndexedDB (как есть, уже зашифрованными —
+//    расшифровка тут не нужна, мы просто переносим блоки данных).
+// 3. Проверяем, что в IndexedDB оказалось столько же записей, сколько было
+//    в LocalStorage — только после этой проверки считаем миграцию успешной.
+// 4. НИКОГДА не удаляем оригинальные ключи LocalStorage автоматически —
+//    они остаются как дополнительная подстраховка, даже после успешной
+//    миграции. Они просто перестают использоваться.
+async function migrateLocalStorageToIndexedDB(db) {
+  const alreadyMigrated = localStorage.getItem(SA_STORAGE_MODE_KEY) === "indexeddb";
+  if (alreadyMigrated) return;
+
+  const rawDocs = loadRawArray(SA_DOCS_KEY);
+  const rawFiles = loadRawArray(SA_FILES_KEY);
+  const rawFolders = loadRawArray(SA_FOLDERS_KEY);
+
+  // Папки до этой версии не имели parentId (вложенных папок не было) —
+  // при миграции проставляем parentId: null, то есть "корневая папка".
+  const rawFoldersWithParent = rawFolders.map((f) => ({ parentId: null, ...f }));
+
+  // Шаг 1: резервная копия (ничего не удаляем, просто дублируем под другим
+  // ключом — так оригинал остаётся нетронутым даже от случайной ошибки ниже).
+  localStorage.setItem(`${SA_DOCS_KEY}__backup`, JSON.stringify(rawDocs));
+  localStorage.setItem(`${SA_FILES_KEY}__backup`, JSON.stringify(rawFiles));
+  localStorage.setItem(`${SA_FOLDERS_KEY}__backup`, JSON.stringify(rawFoldersWithParent));
+  localStorage.setItem(SA_MIGRATION_BACKUP_AT_KEY, new Date().toISOString());
+
+  // Если переносить нечего (новый, пустой архив) — сразу помечаем как
+  // мигрированный, без лишней работы.
+  if (!rawDocs.length && !rawFiles.length && !rawFoldersWithParent.length) {
+    localStorage.setItem(SA_STORAGE_MODE_KEY, "indexeddb");
+    return;
+  }
+
+  // Шаг 2: перенос в IndexedDB.
+  await idbReplaceAll(db, "documents", rawDocs);
+  await idbReplaceAll(db, "files", rawFiles);
+  await idbReplaceAll(db, "folders", rawFoldersWithParent);
+
+  // Шаг 3: проверка, что ничего не потерялось.
+  const verifyDocs = await idbGetAll(db, "documents");
+  const verifyFiles = await idbGetAll(db, "files");
+  const verifyFolders = await idbGetAll(db, "folders");
+
+  const migrationOk =
+    verifyDocs.length === rawDocs.length &&
+    verifyFiles.length === rawFiles.length &&
+    verifyFolders.length === rawFoldersWithParent.length;
+
+  if (!migrationOk) {
+    throw new Error(
+      "Проверка миграции в IndexedDB не прошла: количество записей не совпадает. " +
+        "Резервная копия сохранена в LocalStorage (ключи с суффиксом __backup)."
+    );
+  }
+
+  // Шаг 4: помечаем как мигрированное. Оригинальные ключи LocalStorage
+  // намеренно НЕ удаляются — см. комментарий выше.
+  localStorage.setItem(SA_STORAGE_MODE_KEY, "indexeddb");
+}
+
+// --- Универсальный доступ к коллекциям (документы/файлы/папки) ---
+// Скрывает разницу между IndexedDB и запасным вариантом на LocalStorage.
+
+async function loadRawCollection(storeName, localStorageKey) {
+  if (storageMode === "indexeddb") {
+    return idbGetAll(idbInstance, storeName);
+  }
+  return loadRawArray(localStorageKey);
+}
+
+async function saveRawCollection(storeName, localStorageKey, items) {
+  if (storageMode === "indexeddb") {
+    await idbReplaceAll(idbInstance, storeName, items);
+  } else {
+    localStorage.setItem(localStorageKey, JSON.stringify(items));
+  }
+}
 
 // --- Шифрование содержимого ---
 
@@ -47,23 +206,11 @@ async function decryptPayload(enc) {
   return JSON.parse(new TextDecoder().decode(plainBuffer));
 }
 
-// --- Хранилище ---
-
-function loadRawArray(key) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : [];
-  } catch (error) {
-    console.error(`Не удалось прочитать ${key} из LocalStorage:`, error);
-    return [];
-  }
-}
-
-// Загружает и расшифровывает массив; элементы в старом (незашифрованном)
-// формате подхватывает как есть и помечает на повторное сохранение —
-// так старые данные не теряются при обновлении на версию с шифрованием.
-async function loadEncryptedArray(key, secretFields) {
-  const raw = loadRawArray(key);
+// Загружает и расшифровывает коллекцию; элементы в старом (незашифрованном)
+// формате подхватывает как есть и помечает на повторное сохранение — так
+// старые данные не теряются при любом обновлении формата хранения.
+async function loadEncryptedCollection(storeName, localStorageKey) {
+  const raw = await loadRawCollection(storeName, localStorageKey);
   let needsMigration = false;
 
   const items = await Promise.all(
@@ -82,7 +229,7 @@ async function loadEncryptedArray(key, secretFields) {
   return { items, needsMigration };
 }
 
-async function saveEncryptedArray(key, items, secretFieldNames) {
+async function saveEncryptedCollection(storeName, localStorageKey, items, secretFieldNames) {
   const encrypted = await Promise.all(
     items.map(async (item) => {
       const meta = {};
@@ -98,20 +245,20 @@ async function saveEncryptedArray(key, items, secretFieldNames) {
       return meta;
     })
   );
-  localStorage.setItem(key, JSON.stringify(encrypted));
+  await saveRawCollection(storeName, localStorageKey, encrypted);
 }
 
 async function saveDocuments() {
-  await saveEncryptedArray(SA_DOCS_KEY, documents, ["title", "content"]);
+  await saveEncryptedCollection("documents", SA_DOCS_KEY, documents, ["title", "content"]);
 }
 
 async function saveFolders() {
-  await saveEncryptedArray(SA_FOLDERS_KEY, folders, ["name"]);
+  await saveEncryptedCollection("folders", SA_FOLDERS_KEY, folders, ["name"]);
 }
 
 async function saveFiles() {
   try {
-    await saveEncryptedArray(SA_FILES_KEY, files, ["name", "dataUrl"]);
+    await saveEncryptedCollection("files", SA_FILES_KEY, files, ["name", "dataUrl"]);
     return true;
   } catch (error) {
     console.error("Не удалось сохранить файлы:", error);
@@ -150,6 +297,10 @@ function fileIconFor(mimeType, name) {
   return "📦";
 }
 
+function maxFileSize() {
+  return storageMode === "indexeddb" ? MAX_FILE_SIZE_INDEXEDDB : MAX_FILE_SIZE_LOCALSTORAGE;
+}
+
 // --- DOM ---
 
 const navItems = document.querySelectorAll(".nav-item");
@@ -169,6 +320,8 @@ const recentEmptyEl = document.getElementById("recent-empty");
 const foldersListEl = document.getElementById("folders-list");
 const newFolderBtn = document.getElementById("new-folder-btn");
 const folderModalOverlay = document.getElementById("folder-modal-overlay");
+const folderModalTitle = document.getElementById("folder-modal-title");
+const folderFormSubmit = document.getElementById("folder-form-submit");
 const folderModalClose = document.getElementById("folder-modal-close");
 const folderForm = document.getElementById("folder-form");
 const folderNameInput = document.getElementById("folder-name-input");
@@ -176,6 +329,7 @@ const folderNameInput = document.getElementById("folder-name-input");
 const docsGridEl = document.getElementById("docs-grid");
 const docsEmptyEl = document.getElementById("docs-empty");
 const docSearchInput = document.getElementById("doc-search");
+const docSortSelect = document.getElementById("doc-sort-select");
 const newDocBtn = document.getElementById("new-doc-btn");
 const docFolderChip = document.getElementById("doc-folder-chip");
 const docFolderChipLabel = document.getElementById("doc-folder-chip-label");
@@ -192,6 +346,7 @@ const docFolderSelect = document.getElementById("doc-folder-select");
 const filesGridEl = document.getElementById("files-grid");
 const filesEmptyEl = document.getElementById("files-empty");
 const fileSearchInput = document.getElementById("file-search");
+const fileSortSelect = document.getElementById("file-sort-select");
 const uploadFileBtn = document.getElementById("upload-file-btn");
 const fileInput = document.getElementById("file-input");
 const fileFolderChip = document.getElementById("file-folder-chip");
@@ -223,22 +378,24 @@ logoutBtn.addEventListener("click", () => {
 
 // --- Экспорт / импорт (перенос данных на другое устройство) ---
 //
-// Файл экспорта содержит те же зашифрованные блоки, что лежат в localStorage —
+// Файл экспорта содержит те же зашифрованные блоки, что лежат в хранилище —
 // открыть и прочитать его можно только зная тот же код доступа (им же на
-// другом устройстве будет расшифрован этот файл при импорте).
+// другом устройстве будет расшифрован этот файл при импорте). Формат файла
+// не зависит от того, лежат ли данные в IndexedDB или в LocalStorage —
+// экспорт/импорт одинаково совместимы в обе стороны.
 
 const exportBtn = document.getElementById("export-btn");
 const importBtn = document.getElementById("import-btn");
 const importFileInput = document.getElementById("import-file-input");
 
-function exportArchive() {
+async function exportArchive() {
   const payload = {
     app: "secret-archive-backup",
     version: 1,
     exportedAt: new Date().toISOString(),
-    documents: loadRawArray(SA_DOCS_KEY),
-    files: loadRawArray(SA_FILES_KEY),
-    folders: loadRawArray(SA_FOLDERS_KEY),
+    documents: await loadRawCollection("documents", SA_DOCS_KEY),
+    files: await loadRawCollection("files", SA_FILES_KEY),
+    folders: await loadRawCollection("folders", SA_FOLDERS_KEY),
   };
 
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -313,11 +470,12 @@ async function importArchive(file) {
     return;
   }
 
-  // Папки: добавляем только те, которых ещё нет (по id). Существующие не трогаем.
+  // Папки: добавляем только те, которых ещё нет (по id). Старые бэкапы без
+  // parentId получают parentId: null (корень) — ничего не ломается.
   let addedFolders = 0;
   foldersResult.items.forEach((folder) => {
     if (!folders.some((f) => f.id === folder.id)) {
-      folders.push(folder);
+      folders.push({ parentId: null, ...folder });
       addedFolders++;
     }
   });
@@ -371,7 +529,7 @@ importFileInput.addEventListener("change", async () => {
   await importArchive(file);
 });
 
-// --- Папки ---
+// --- Папки (с вложенностью) ---
 
 function getFolderName(folderId) {
   const folder = folders.find((f) => f.id === folderId);
@@ -384,17 +542,59 @@ function countItemsInFolder(folderId) {
   return docCount + fileCount;
 }
 
-function openFolderModal() {
+function getChildFolders(parentId) {
+  return folders
+    .filter((f) => f.parentId === parentId)
+    .sort((a, b) => a.name.localeCompare(b.name, "ru"));
+}
+
+function folderHasChildren(folderId) {
+  return folders.some((f) => f.parentId === folderId);
+}
+
+// Строит плоский список всех папок с указанием глубины вложенности —
+// используется для выпадающих списков (там нельзя показать настоящее дерево,
+// поэтому вложенность показываем отступом «— »).
+function getFlatFolderList() {
+  const result = [];
+  function walk(parentId, depth) {
+    getChildFolders(parentId).forEach((folder) => {
+      result.push({ folder, depth });
+      walk(folder.id, depth + 1);
+    });
+  }
+  walk(null, 0);
+  return result;
+}
+
+function openFolderModal({ parentId = null, editFolder = null } = {}) {
   folderForm.reset();
+  editingFolderId = editFolder ? editFolder.id : null;
+  creatingFolderParentId = parentId;
+
+  if (editFolder) {
+    folderModalTitle.textContent = "Переименовать папку";
+    folderNameInput.value = editFolder.name;
+    folderFormSubmit.textContent = "Сохранить";
+  } else if (parentId) {
+    folderModalTitle.textContent = `Новая папка в «${getFolderName(parentId)}»`;
+    folderFormSubmit.textContent = "Создать";
+  } else {
+    folderModalTitle.textContent = "Новая папка";
+    folderFormSubmit.textContent = "Создать";
+  }
+
   folderModalOverlay.hidden = false;
   folderNameInput.focus();
 }
 
 function closeFolderModal() {
   folderModalOverlay.hidden = true;
+  editingFolderId = null;
+  creatingFolderParentId = null;
 }
 
-newFolderBtn.addEventListener("click", openFolderModal);
+newFolderBtn.addEventListener("click", () => openFolderModal());
 folderModalClose.addEventListener("click", closeFolderModal);
 folderModalOverlay.addEventListener("click", (e) => {
   if (e.target === folderModalOverlay) closeFolderModal();
@@ -405,7 +605,15 @@ folderForm.addEventListener("submit", async (event) => {
   const name = folderNameInput.value.trim();
   if (!name) return;
 
-  folders.push({ id: generateId(), name, createdAt: new Date().toISOString() });
+  if (editingFolderId) {
+    const folder = folders.find((f) => f.id === editingFolderId);
+    if (folder) folder.name = name;
+  } else {
+    const parentId = creatingFolderParentId;
+    folders.push({ id: generateId(), name, parentId, createdAt: new Date().toISOString() });
+    if (parentId) expandedFolderIds.add(parentId);
+  }
+
   await saveFolders();
   closeFolderModal();
   renderAll();
@@ -421,9 +629,17 @@ function setActiveFolder(folderId) {
 async function deleteFolder(folderId) {
   const folder = folders.find((f) => f.id === folderId);
   if (!folder) return;
-  if (!confirm(`Удалить папку «${folder.name}»? Документы и файлы в ней останутся, но потеряют папку.`)) {
-    return;
-  }
+  const hasChildren = folderHasChildren(folderId);
+  const warning = hasChildren
+    ? `Удалить папку «${folder.name}»? Вложенные папки переместятся на уровень выше, а документы и файлы в ней останутся, но потеряют папку.`
+    : `Удалить папку «${folder.name}»? Документы и файлы в ней останутся, но потеряют папку.`;
+  if (!confirm(warning)) return;
+
+  // Вложенные папки поднимаем на уровень выше (к родителю удаляемой папки),
+  // а не удаляем вместе с ней и не делаем сиротами — дерево остаётся целым.
+  folders.forEach((f) => {
+    if (f.parentId === folderId) f.parentId = folder.parentId;
+  });
 
   folders = folders.filter((f) => f.id !== folderId);
   documents.forEach((d) => {
@@ -438,53 +654,114 @@ async function deleteFolder(folderId) {
   await saveFiles();
 
   if (activeFolderId === folderId) activeFolderId = null;
+  expandedFolderIds.delete(folderId);
   renderAll();
+}
+
+function renderFolderNode(folder, depth, container) {
+  const hasChildren = folderHasChildren(folder.id);
+  const isExpanded = expandedFolderIds.has(folder.id);
+
+  const item = document.createElement("div");
+  item.className = "folder-item" + (activeFolderId === folder.id ? " active" : "");
+  item.style.paddingLeft = `${8 + depth * 18}px`;
+
+  if (hasChildren) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "folder-toggle" + (isExpanded ? " expanded" : "");
+    toggle.textContent = "▸";
+    toggle.setAttribute("aria-label", isExpanded ? "Свернуть" : "Развернуть");
+    toggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (expandedFolderIds.has(folder.id)) {
+        expandedFolderIds.delete(folder.id);
+      } else {
+        expandedFolderIds.add(folder.id);
+      }
+      renderFolders();
+    });
+    item.appendChild(toggle);
+  } else {
+    const spacer = document.createElement("span");
+    spacer.className = "folder-toggle-spacer";
+    item.appendChild(spacer);
+  }
+
+  const name = document.createElement("span");
+  name.className = "folder-name";
+  name.textContent = `📁 ${folder.name}`;
+  name.addEventListener("click", () => {
+    setActiveFolder(activeFolderId === folder.id ? null : folder.id);
+  });
+
+  const count = document.createElement("span");
+  count.className = "folder-count";
+  count.textContent = countItemsInFolder(folder.id);
+
+  const actions = document.createElement("div");
+  actions.className = "folder-actions";
+
+  const addSubBtn = document.createElement("button");
+  addSubBtn.type = "button";
+  addSubBtn.className = "folder-action";
+  addSubBtn.textContent = "+";
+  addSubBtn.setAttribute("aria-label", `Новая папка в «${folder.name}»`);
+  addSubBtn.title = "Новая вложенная папка";
+  addSubBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openFolderModal({ parentId: folder.id });
+  });
+
+  const renameBtn = document.createElement("button");
+  renameBtn.type = "button";
+  renameBtn.className = "folder-action";
+  renameBtn.textContent = "✎";
+  renameBtn.setAttribute("aria-label", `Переименовать папку ${folder.name}`);
+  renameBtn.title = "Переименовать";
+  renameBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openFolderModal({ editFolder: folder });
+  });
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.type = "button";
+  deleteBtn.className = "folder-action folder-delete";
+  deleteBtn.textContent = "✕";
+  deleteBtn.setAttribute("aria-label", `Удалить папку ${folder.name}`);
+  deleteBtn.title = "Удалить";
+  deleteBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    deleteFolder(folder.id);
+  });
+
+  actions.appendChild(addSubBtn);
+  actions.appendChild(renameBtn);
+  actions.appendChild(deleteBtn);
+
+  item.appendChild(name);
+  item.appendChild(count);
+  item.appendChild(actions);
+  container.appendChild(item);
+
+  if (hasChildren && isExpanded) {
+    getChildFolders(folder.id).forEach((child) => renderFolderNode(child, depth + 1, container));
+  }
 }
 
 function renderFolders() {
   foldersListEl.innerHTML = "";
-
-  folders.forEach((folder) => {
-    const item = document.createElement("div");
-    item.className = "folder-item" + (activeFolderId === folder.id ? " active" : "");
-
-    const name = document.createElement("span");
-    name.className = "folder-name";
-    name.textContent = `📁 ${folder.name}`;
-    name.addEventListener("click", () => {
-      setActiveFolder(activeFolderId === folder.id ? null : folder.id);
-    });
-
-    const count = document.createElement("span");
-    count.className = "folder-count";
-    count.textContent = countItemsInFolder(folder.id);
-
-    const deleteBtn = document.createElement("button");
-    deleteBtn.type = "button";
-    deleteBtn.className = "folder-delete";
-    deleteBtn.textContent = "✕";
-    deleteBtn.setAttribute("aria-label", `Удалить папку ${folder.name}`);
-    deleteBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      deleteFolder(folder.id);
-    });
-
-    item.appendChild(name);
-    item.appendChild(count);
-    item.appendChild(deleteBtn);
-    foldersListEl.appendChild(item);
-  });
-
+  getChildFolders(null).forEach((folder) => renderFolderNode(folder, 0, foldersListEl));
   renderFolderSelectOptions();
 }
 
 function renderFolderSelectOptions() {
   const current = docFolderSelect.value;
   docFolderSelect.innerHTML = '<option value="">Без папки</option>';
-  folders.forEach((folder) => {
+  getFlatFolderList().forEach(({ folder, depth }) => {
     const opt = document.createElement("option");
     opt.value = folder.id;
-    opt.textContent = folder.name;
+    opt.textContent = `${"— ".repeat(depth)}${folder.name}`;
     docFolderSelect.appendChild(opt);
   });
   docFolderSelect.value = current;
@@ -499,10 +776,10 @@ function createFolderMiniSelect(item, onChange) {
   noneOpt.textContent = "Без папки";
   select.appendChild(noneOpt);
 
-  folders.forEach((folder) => {
+  getFlatFolderList().forEach(({ folder, depth }) => {
     const opt = document.createElement("option");
     opt.value = folder.id;
-    opt.textContent = `📁 ${folder.name}`;
+    opt.textContent = `${"— ".repeat(depth)}📁 ${folder.name}`;
     select.appendChild(opt);
   });
 
@@ -545,11 +822,33 @@ function renderHome() {
   recentEmptyEl.hidden = recent.length !== 0;
 }
 
+// --- Сортировка (общая для документов и файлов) ---
+
+function applySort(items, sortValue, nameField, dateField) {
+  const sorted = [...items];
+  switch (sortValue) {
+    case "date-asc":
+      sorted.sort((a, b) => new Date(a[dateField]) - new Date(b[dateField]));
+      break;
+    case "name-asc":
+      sorted.sort((a, b) => a[nameField].localeCompare(b[nameField], "ru"));
+      break;
+    case "name-desc":
+      sorted.sort((a, b) => b[nameField].localeCompare(a[nameField], "ru"));
+      break;
+    case "date-desc":
+    default:
+      sorted.sort((a, b) => new Date(b[dateField]) - new Date(a[dateField]));
+      break;
+  }
+  return sorted;
+}
+
 // --- Документы ---
 
 function getFilteredDocuments() {
   const query = docSearchInput.value.trim().toLowerCase();
-  return documents.filter((d) => {
+  const filtered = documents.filter((d) => {
     const matchesFolder = activeFolderId === null || d.folderId === activeFolderId;
     const matchesQuery =
       !query ||
@@ -557,6 +856,7 @@ function getFilteredDocuments() {
       d.content.toLowerCase().includes(query);
     return matchesFolder && matchesQuery;
   });
+  return applySort(filtered, docSortSelect.value, "title", "updatedAt");
 }
 
 function openCreateDocModal() {
@@ -718,17 +1018,19 @@ function renderDocs() {
 }
 
 docSearchInput.addEventListener("input", renderDocs);
+docSortSelect.addEventListener("change", renderDocs);
 docFolderChipClear.addEventListener("click", () => setActiveFolder(null));
 
 // --- Файлы ---
 
 function getFilteredFiles() {
   const query = fileSearchInput.value.trim().toLowerCase();
-  return files.filter((f) => {
+  const filtered = files.filter((f) => {
     const matchesFolder = activeFolderId === null || f.folderId === activeFolderId;
     const matchesQuery = !query || f.name.toLowerCase().includes(query);
     return matchesFolder && matchesQuery;
   });
+  return applySort(filtered, fileSortSelect.value, "name", "createdAt");
 }
 
 uploadFileBtn.addEventListener("click", () => fileInput.click());
@@ -738,11 +1040,11 @@ fileInput.addEventListener("change", async () => {
   fileInput.value = "";
   if (!file) return;
 
-  if (file.size > MAX_FILE_SIZE) {
+  const limit = maxFileSize();
+  if (file.size > limit) {
     alert(
       `Файл слишком большой (${formatBytes(file.size)}). ` +
-        `Максимальный размер — ${formatBytes(MAX_FILE_SIZE)}, ` +
-        `так как файлы хранятся в localStorage браузера без сервера.`
+        `Максимальный размер — ${formatBytes(limit)}.`
     );
     return;
   }
@@ -895,6 +1197,7 @@ function renderFiles() {
 }
 
 fileSearchInput.addEventListener("input", renderFiles);
+fileSortSelect.addEventListener("change", renderFiles);
 fileFolderChipClear.addEventListener("click", () => setActiveFolder(null));
 
 // --- Общий рендер ---
@@ -914,7 +1217,7 @@ document.addEventListener("keydown", (event) => {
   if (!folderModalOverlay.hidden) closeFolderModal();
 });
 
-// --- Инициализация: получаем ключ сессии и расшифровываем архив ---
+// --- Инициализация: получаем ключ сессии, готовим хранилище, расшифровываем архив ---
 
 async function init() {
   encryptionKey = await getArchiveEncryptionKey();
@@ -927,20 +1230,31 @@ async function init() {
     return;
   }
 
+  // Готовим хранилище: пробуем IndexedDB, при неудаче остаёмся на
+  // LocalStorage (как было раньше) — архив в любом случае должен открыться.
+  try {
+    idbInstance = await openDatabase();
+    await migrateLocalStorageToIndexedDB(idbInstance);
+    storageMode = "indexeddb";
+  } catch (error) {
+    console.error("IndexedDB недоступен или миграция не удалась, используем LocalStorage:", error);
+    storageMode = "localStorage";
+  }
+
   try {
     const [docsResult, filesResult, foldersResult] = await Promise.all([
-      loadEncryptedArray(SA_DOCS_KEY, ["title", "content"]),
-      loadEncryptedArray(SA_FILES_KEY, ["name", "dataUrl"]),
-      loadEncryptedArray(SA_FOLDERS_KEY, ["name"]),
+      loadEncryptedCollection("documents", SA_DOCS_KEY),
+      loadEncryptedCollection("files", SA_FILES_KEY),
+      loadEncryptedCollection("folders", SA_FOLDERS_KEY),
     ]);
 
     documents = docsResult.items;
     files = filesResult.items;
-    folders = foldersResult.items;
+    folders = foldersResult.items.map((f) => ({ parentId: null, ...f }));
 
     // Если нашлись данные в старом незашифрованном формате — сразу
     // пересохраняем их в зашифрованном виде, чтобы они больше не лежали
-    // в localStorage открытым текстом.
+    // в хранилище открытым текстом.
     if (docsResult.needsMigration) await saveDocuments();
     if (filesResult.needsMigration) await saveFiles();
     if (foldersResult.needsMigration) await saveFolders();

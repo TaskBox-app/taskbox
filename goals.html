@@ -107,6 +107,12 @@
 
         <div class="toolbar">
           <input type="search" id="doc-search" class="search-input" placeholder="Поиск по документам..." />
+          <select id="doc-sort-select" class="sort-select" title="Сортировка">
+            <option value="date-desc">Сначала новые</option>
+            <option value="date-asc">Сначала старые</option>
+            <option value="name-asc">Название А→Я</option>
+            <option value="name-desc">Название Я→А</option>
+          </select>
           <span class="filter-chip" id="doc-folder-chip" hidden>
             <span id="doc-folder-chip-label"></span>
             <button type="button" id="doc-folder-chip-clear" aria-label="Снять фильтр">×</button>
@@ -127,6 +133,12 @@
 
         <div class="toolbar">
           <input type="search" id="file-search" class="search-input" placeholder="Поиск по файлам..." />
+          <select id="file-sort-select" class="sort-select" title="Сортировка">
+            <option value="date-desc">Сначала новые</option>
+            <option value="date-asc">Сначала старые</option>
+            <option value="name-asc">Название А→Я</option>
+            <option value="name-desc">Название Я→А</option>
+          </select>
           <span class="filter-chip" id="file-folder-chip" hidden>
             <span id="file-folder-chip-label"></span>
             <button type="button" id="file-folder-chip-clear" aria-label="Снять фильтр">×</button>
@@ -172,7 +184,7 @@
           <span>Название папки</span>
           <input type="text" id="folder-name-input" maxlength="60" required />
         </label>
-        <button type="submit" class="save-btn">Создать</button>
+        <button type="submit" class="save-btn" id="folder-form-submit">Создать</button>
       </form>
     </div>
   </div>
