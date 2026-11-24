@@ -258,16 +258,25 @@ button, input, textarea, select {
   font-weight: 600;
 }
 
-.backup-hint {
-  color: var(--muted);
-  font-size: 0.85rem;
-  margin-bottom: 12px;
+.backup-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+  max-width: 480px;
+  margin-bottom: 16px;
 }
 
-.backup-actions {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
+.backup-card-title {
+  font-size: 1.05rem;
+  margin-bottom: 10px;
+}
+
+.backup-card-text {
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+  margin-bottom: 16px;
 }
 
 /* --- Главная: статистика --- */

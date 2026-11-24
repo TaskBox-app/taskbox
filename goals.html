@@ -30,6 +30,7 @@
         <button type="button" class="nav-item active" data-view="home">🏠 Главная</button>
         <button type="button" class="nav-item" data-view="documents">📄 Документы</button>
         <button type="button" class="nav-item" data-view="files">🗂 Файлы</button>
+        <button type="button" class="nav-item" data-view="backup">💾 Резервная копия</button>
       </nav>
 
       <div class="folders-section">
@@ -66,12 +67,31 @@
         <h2 class="section-title">Недавно добавленные документы</h2>
         <div class="recent-list" id="recent-list"></div>
         <p class="empty-hint" id="recent-empty" hidden>Пока пусто. Создай первый документ во вкладке «Документы».</p>
+      </section>
 
-        <h2 class="section-title">Резервная копия</h2>
-        <p class="backup-hint">Перенос данных на другое устройство — вручную, через файл.</p>
-        <div class="backup-actions">
-          <button type="button" class="ghost-btn" id="export-btn" title="Скачать зашифрованный файл-бэкап со всеми данными">⬇ Экспорт</button>
-          <button type="button" class="ghost-btn" id="import-btn" title="Загрузить данные из файла-бэкапа">⬆ Импорт</button>
+      <!-- Резервная копия -->
+      <section class="view" id="view-backup" hidden>
+        <h1 class="view-title">Резервная копия</h1>
+        <p class="view-subtitle">Перенос данных на другое устройство — вручную, через файл</p>
+
+        <div class="backup-card">
+          <h2 class="backup-card-title">⬇ Экспорт</h2>
+          <p class="backup-card-text">
+            Скачивает один файл со всеми документами, файлами и папками. Содержимое
+            зашифровано тем же кодом доступа — файл можно спокойно переслать себе
+            по почте, через облако или флешку.
+          </p>
+          <button type="button" class="primary-btn" id="export-btn">⬇ Скачать архив</button>
+        </div>
+
+        <div class="backup-card">
+          <h2 class="backup-card-title">⬆ Импорт</h2>
+          <p class="backup-card-text">
+            Загружает ранее скачанный файл на этом устройстве. Новые документы,
+            файлы и папки добавятся, уже существующие не потеряются — для
+            документов побеждает более свежая версия (по дате изменения).
+          </p>
+          <button type="button" class="primary-btn" id="import-btn">⬆ Выбрать файл</button>
           <input type="file" id="import-file-input" accept="application/json,.json" hidden />
         </div>
       </section>

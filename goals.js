@@ -157,6 +157,7 @@ const views = {
   home: document.getElementById("view-home"),
   documents: document.getElementById("view-documents"),
   files: document.getElementById("view-files"),
+  backup: document.getElementById("view-backup"),
 };
 
 const statDocsEl = document.getElementById("stat-docs");
