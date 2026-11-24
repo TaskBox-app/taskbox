@@ -40,11 +40,6 @@
         <div class="folders-list" id="folders-list"></div>
       </div>
 
-      <div class="sidebar-actions">
-        <button type="button" class="sidebar-action-btn" id="export-btn" title="Скачать зашифрованный файл-бэкап со всеми данными">⬇ Экспорт</button>
-        <button type="button" class="sidebar-action-btn" id="import-btn" title="Загрузить данные из файла-бэкапа">⬆ Импорт</button>
-        <input type="file" id="import-file-input" accept="application/json,.json" hidden />
-      </div>
     </aside>
 
     <main class="main">
@@ -71,6 +66,14 @@
         <h2 class="section-title">Недавно добавленные документы</h2>
         <div class="recent-list" id="recent-list"></div>
         <p class="empty-hint" id="recent-empty" hidden>Пока пусто. Создай первый документ во вкладке «Документы».</p>
+
+        <h2 class="section-title">Резервная копия</h2>
+        <p class="backup-hint">Перенос данных на другое устройство — вручную, через файл.</p>
+        <div class="backup-actions">
+          <button type="button" class="ghost-btn" id="export-btn" title="Скачать зашифрованный файл-бэкап со всеми данными">⬇ Экспорт</button>
+          <button type="button" class="ghost-btn" id="import-btn" title="Загрузить данные из файла-бэкапа">⬆ Импорт</button>
+          <input type="file" id="import-file-input" accept="application/json,.json" hidden />
+        </div>
       </section>
 
       <!-- Документы -->

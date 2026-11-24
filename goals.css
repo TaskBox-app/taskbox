@@ -198,31 +198,6 @@ button, input, textarea, select {
   color: var(--danger);
 }
 
-.sidebar-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 10px;
-}
-
-.sidebar-action-btn {
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
-  padding: 9px 10px;
-  border-radius: 10px;
-  font-size: 0.85rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  text-align: left;
-}
-
-.sidebar-action-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
 .logout-corner-btn {
   position: fixed;
   top: 14px;
@@ -281,6 +256,18 @@ button, input, textarea, select {
   color: var(--muted);
   margin: 30px 0 14px;
   font-weight: 600;
+}
+
+.backup-hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-bottom: 12px;
+}
+
+.backup-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 /* --- Главная: статистика --- */
@@ -728,12 +715,6 @@ button, input, textarea, select {
     width: 100%;
     order: 3;
     max-height: 140px;
-  }
-
-  .sidebar-actions {
-    flex-direction: row;
-    margin-top: 0;
-    order: 2;
   }
 
   .sidebar {
