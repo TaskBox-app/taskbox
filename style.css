@@ -367,15 +367,54 @@ body {
   }
 
   .task-form {
-    flex-direction: column;
+    gap: 8px;
+  }
+
+  .task-input {
+    padding: 12px 14px;
   }
 
   .add-btn {
-    width: 100%;
+    padding: 0;
+    width: 48px;
+    height: 48px;
+    flex-shrink: 0;
+    font-size: 0;
+  }
+
+  .add-btn::before {
+    content: "+";
+    font-size: 1.6rem;
+    line-height: 1;
   }
 
   .stats {
     flex-direction: column;
     text-align: center;
+  }
+
+  .filters {
+    background: var(--border);
+    padding: 4px;
+    border-radius: var(--radius);
+    gap: 2px;
+  }
+
+  .filter-btn {
+    border: none;
+    padding: 9px 4px;
+    border-radius: calc(var(--radius) - 4px);
+    background: transparent;
+    font-size: 0.85rem;
+  }
+
+  .filter-btn:hover {
+    color: var(--text-muted);
+  }
+
+  .filter-btn.active {
+    background: #fff;
+    color: var(--purple-dark);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
   }
 }
