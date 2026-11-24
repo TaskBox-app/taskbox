@@ -716,6 +716,7 @@ button, input, textarea, select {
 
   .nav {
     flex-direction: row;
+    flex-wrap: wrap;
     margin-bottom: 0;
   }
 
