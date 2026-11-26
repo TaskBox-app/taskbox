@@ -10,6 +10,10 @@
 // хранилище через консоль разработчика, не вводя код доступа. Метаданные
 // (даты, размер, id папки/родителя) не шифруются — они нужны для сортировки
 // и фильтрации и не считаются секретными.
+//
+// Дополнительно отдельные документы и файлы можно защитить СВОИМ паролем
+// (см. раздел «Пароль на документ/файл» ниже) — это второй, независимый
+// слой шифрования поверх общего, с собственным ключом.
 // Подробности и честные ограничения — в README.md.
 
 const SA_DOCS_KEY = "secret-archive-documents";
@@ -17,6 +21,7 @@ const SA_FILES_KEY = "secret-archive-files";
 const SA_FOLDERS_KEY = "secret-archive-folders";
 const SA_STORAGE_MODE_KEY = "secret-archive-storage-mode";
 const SA_MIGRATION_BACKUP_AT_KEY = "secret-archive-migration-backup-at";
+const SA_DOC_DRAFT_KEY = "secret-archive-doc-draft";
 
 const IDB_NAME = "secret-archive-db";
 const IDB_VERSION = 1;
@@ -27,6 +32,10 @@ localStorage.removeItem("taskbox-goals");
 
 const MAX_FILE_SIZE_LOCALSTORAGE = 2 * 1024 * 1024; // 2 МБ — старый лимит для LocalStorage
 const MAX_FILE_SIZE_INDEXEDDB = 25 * 1024 * 1024; // 25 МБ — IndexedDB на порядки просторнее
+
+const LOCKED_DOC_PLACEHOLDER_TITLE = "🔒 Защищённый документ";
+const LOCKED_FILE_PLACEHOLDER_NAME = "🔒 Защищённый файл";
+const ITEM_LOCK_PBKDF2_ITERATIONS = 150000;
 
 // --- Состояние (заполняется асинхронно в init(), после расшифровки) ---
 
@@ -41,6 +50,11 @@ let editingDocId = null;
 let editingFolderId = null; // null = создаём новую папку, иначе — переименовываем
 let creatingFolderParentId = null; // id родителя для новой папки (null = корень)
 const expandedFolderIds = new Set(); // какие папки раскрыты в дереве (только в памяти)
+
+// Ключи индивидуальной защиты документов/файлов, которые разблокированы в
+// этой сессии (id -> CryptoKey). Живёт только в памяти, исчезает при выходе
+// или перезагрузке — как и основной ключ архива.
+const unlockedItemKeys = new Map();
 
 // --- Хранилище: IndexedDB с запасным вариантом на LocalStorage ---
 //
@@ -190,35 +204,109 @@ async function saveRawCollection(storeName, localStorageKey, items) {
   }
 }
 
-// --- Шифрование содержимого ---
+// --- Шифрование содержимого (основной ключ архива) ---
 
-async function encryptPayload(payload) {
+async function encryptPayload(payload, key = encryptionKey) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const data = new TextEncoder().encode(JSON.stringify(payload));
-  const cipherBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, encryptionKey, data);
+  const cipherBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
   return { iv: arrayBufferToBase64(iv), data: arrayBufferToBase64(cipherBuffer) };
 }
 
-async function decryptPayload(enc) {
+async function decryptPayload(enc, key = encryptionKey) {
   const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
   const cipherBuffer = base64ToArrayBuffer(enc.data);
-  const plainBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, encryptionKey, cipherBuffer);
+  const plainBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipherBuffer);
   return JSON.parse(new TextDecoder().decode(plainBuffer));
 }
 
-// Загружает и расшифровывает коллекцию; элементы в старом (незашифрованном)
-// формате подхватывает как есть и помечает на повторное сохранение — так
-// старые данные не теряются при любом обновлении формата хранения.
-async function loadEncryptedCollection(storeName, localStorageKey) {
-  const raw = await loadRawCollection(storeName, localStorageKey);
+// --- Пароль на документ/файл (второй, независимый слой шифрования) ---
+//
+// У каждого защищённого документа/файла — свой случайный `lockSalt` и свой
+// ключ AES-GCM-256, выведенный из введённого пароля через PBKDF2 (как и
+// основной ключ архива, но с собственной солью, так что одинаковые пароли
+// на разных элементах дают разные ключи). Пока элемент не разблокирован в
+// этой сессии, его `title`/`content` (или `name`/`dataUrl` у файла) в
+// памяти — это просто плейсхолдер, а настоящие зашифрованные данные лежат
+// в `_lockedEnc` нетронутыми. Ключ разблокированного элемента держится
+// только в памяти (unlockedItemKeys) и исчезает при выходе/перезагрузке —
+// после этого документ снова нужно открывать паролем.
+
+function generateSalt() {
+  return arrayBufferToBase64(crypto.getRandomValues(new Uint8Array(16)).buffer);
+}
+
+async function deriveItemLockKey(password, saltBase64) {
+  const enc = new TextEncoder();
+  const salt = base64ToArrayBuffer(saltBase64);
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: ITEM_LOCK_PBKDF2_ITERATIONS, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"]
+  );
+}
+
+// Ставит пароль на документ/файл, для которого сейчас известно настоящее
+// содержимое (не защищён или уже разблокирован). Сразу оставляет элемент
+// разблокированным в этой сессии.
+async function lockItemWithPassword(item, secretPayload, password) {
+  const salt = generateSalt();
+  const key = await deriveItemLockKey(password, salt);
+  const check = await encryptPayload({ check: "ok" }, key);
+  item.locked = true;
+  item.lockSalt = salt;
+  item.lockCheck = check;
+  item._sealed = false;
+  unlockedItemKeys.set(item.id, key);
+  return key;
+}
+
+// Пробует открыть защищённый элемент паролем. true — пароль верный,
+// элемент расшифрован и остаётся разблокированным в памяти до конца сессии.
+async function tryUnlockItem(item, password) {
+  try {
+    const key = await deriveItemLockKey(password, item.lockSalt);
+    await decryptPayload(item.lockCheck, key); // бросит исключение, если пароль неверный
+    const secret = await decryptPayload(item._lockedEnc, key);
+    Object.assign(item, secret);
+    item._sealed = false;
+    unlockedItemKeys.set(item.id, key);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+// --- Загрузка/сохранение документов (с учётом индивидуальной защиты) ---
+
+async function loadDocumentsFromStorage() {
+  const raw = await loadRawCollection("documents", SA_DOCS_KEY);
   let needsMigration = false;
 
   const items = await Promise.all(
     raw.map(async (item) => {
       if (!item.enc) {
         needsMigration = true;
-        const { ...rest } = item;
-        return rest;
+        return { ...item };
+      }
+      if (item.locked) {
+        const { enc, ...meta } = item;
+        return {
+          ...meta,
+          _lockedEnc: enc,
+          _sealed: true,
+          title: LOCKED_DOC_PLACEHOLDER_TITLE,
+          content: "",
+        };
       }
       const { enc, ...meta } = item;
       const secret = await decryptPayload(enc);
@@ -229,36 +317,91 @@ async function loadEncryptedCollection(storeName, localStorageKey) {
   return { items, needsMigration };
 }
 
-async function saveEncryptedCollection(storeName, localStorageKey, items, secretFieldNames) {
+async function saveDocuments() {
   const encrypted = await Promise.all(
-    items.map(async (item) => {
-      const meta = {};
-      const secret = {};
-      Object.keys(item).forEach((field) => {
-        if (secretFieldNames.includes(field)) {
-          secret[field] = item[field];
+    documents.map(async (doc) => {
+      const meta = {
+        id: doc.id,
+        folderId: doc.folderId,
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
+      };
+      if (doc.locked) {
+        meta.locked = true;
+        meta.lockSalt = doc.lockSalt;
+        meta.lockCheck = doc.lockCheck;
+        if (doc._sealed) {
+          meta.enc = doc._lockedEnc; // не трогаем — не расшифровывалось в этой сессии
         } else {
-          meta[field] = item[field];
+          const key = unlockedItemKeys.get(doc.id);
+          meta.enc = await encryptPayload({ title: doc.title, content: doc.content }, key);
         }
-      });
-      meta.enc = await encryptPayload(secret);
+      } else {
+        meta.enc = await encryptPayload({ title: doc.title, content: doc.content });
+      }
       return meta;
     })
   );
-  await saveRawCollection(storeName, localStorageKey, encrypted);
+  await saveRawCollection("documents", SA_DOCS_KEY, encrypted);
 }
 
-async function saveDocuments() {
-  await saveEncryptedCollection("documents", SA_DOCS_KEY, documents, ["title", "content"]);
-}
+async function loadFilesFromStorage() {
+  const raw = await loadRawCollection("files", SA_FILES_KEY);
+  let needsMigration = false;
 
-async function saveFolders() {
-  await saveEncryptedCollection("folders", SA_FOLDERS_KEY, folders, ["name"]);
+  const items = await Promise.all(
+    raw.map(async (item) => {
+      if (!item.enc) {
+        needsMigration = true;
+        return { ...item };
+      }
+      if (item.locked) {
+        const { enc, ...meta } = item;
+        return {
+          ...meta,
+          _lockedEnc: enc,
+          _sealed: true,
+          name: LOCKED_FILE_PLACEHOLDER_NAME,
+          dataUrl: "",
+        };
+      }
+      const { enc, ...meta } = item;
+      const secret = await decryptPayload(enc);
+      return { ...meta, ...secret };
+    })
+  );
+
+  return { items, needsMigration };
 }
 
 async function saveFiles() {
   try {
-    await saveEncryptedCollection("files", SA_FILES_KEY, files, ["name", "dataUrl"]);
+    const encrypted = await Promise.all(
+      files.map(async (file) => {
+        const meta = {
+          id: file.id,
+          folderId: file.folderId,
+          mimeType: file.mimeType,
+          size: file.size,
+          createdAt: file.createdAt,
+        };
+        if (file.locked) {
+          meta.locked = true;
+          meta.lockSalt = file.lockSalt;
+          meta.lockCheck = file.lockCheck;
+          if (file._sealed) {
+            meta.enc = file._lockedEnc;
+          } else {
+            const key = unlockedItemKeys.get(file.id);
+            meta.enc = await encryptPayload({ name: file.name, dataUrl: file.dataUrl }, key);
+          }
+        } else {
+          meta.enc = await encryptPayload({ name: file.name, dataUrl: file.dataUrl });
+        }
+        return meta;
+      })
+    );
+    await saveRawCollection("files", SA_FILES_KEY, encrypted);
     return true;
   } catch (error) {
     console.error("Не удалось сохранить файлы:", error);
@@ -268,6 +411,40 @@ async function saveFiles() {
     );
     return false;
   }
+}
+
+// Папки индивидуально не защищаются паролем (только их содержимое — через
+// массовую блокировку документов/файлов внутри, см. ниже), поэтому для них
+// шифрование как было — только названием, основным ключом архива.
+async function saveFolders() {
+  const encrypted = await Promise.all(
+    folders.map(async (folder) => ({
+      id: folder.id,
+      parentId: folder.parentId,
+      createdAt: folder.createdAt,
+      enc: await encryptPayload({ name: folder.name }),
+    }))
+  );
+  await saveRawCollection("folders", SA_FOLDERS_KEY, encrypted);
+}
+
+async function loadFoldersFromStorage() {
+  const raw = await loadRawCollection("folders", SA_FOLDERS_KEY);
+  let needsMigration = false;
+
+  const items = await Promise.all(
+    raw.map(async (item) => {
+      if (!item.enc) {
+        needsMigration = true;
+        return { parentId: null, ...item };
+      }
+      const { enc, ...meta } = item;
+      const secret = await decryptPayload(enc);
+      return { parentId: null, ...meta, ...secret };
+    })
+  );
+
+  return { items, needsMigration };
 }
 
 function generateId() {
@@ -286,6 +463,17 @@ function formatDate(isoString) {
     day: "2-digit",
     month: "2-digit",
     year: "numeric",
+  });
+}
+
+function formatDateTime(isoString) {
+  const d = new Date(isoString);
+  return d.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
   });
 }
 
@@ -342,6 +530,7 @@ const docForm = document.getElementById("doc-form");
 const docTitleInput = document.getElementById("doc-title-input");
 const docContentInput = document.getElementById("doc-content-input");
 const docFolderSelect = document.getElementById("doc-folder-select");
+const docDraftHint = document.getElementById("doc-draft-hint");
 
 const filesGridEl = document.getElementById("files-grid");
 const filesEmptyEl = document.getElementById("files-empty");
@@ -354,6 +543,73 @@ const fileFolderChipLabel = document.getElementById("file-folder-chip-label");
 const fileFolderChipClear = document.getElementById("file-folder-chip-clear");
 
 const logoutBtn = document.getElementById("logout-btn");
+
+// --- Модалка ввода/установки пароля (общая для документов, файлов, папок) ---
+
+const passwordModalOverlay = document.getElementById("password-modal-overlay");
+const passwordModalTitle = document.getElementById("password-modal-title");
+const passwordModalClose = document.getElementById("password-modal-close");
+const passwordForm = document.getElementById("password-form");
+const passwordFieldLabel = document.getElementById("password-field-label");
+const passwordInput = document.getElementById("password-input");
+const passwordConfirmField = document.getElementById("password-confirm-field");
+const passwordConfirmInput = document.getElementById("password-confirm-input");
+const passwordError = document.getElementById("password-error");
+const passwordFormSubmit = document.getElementById("password-form-submit");
+
+let passwordModalHandler = null; // async (password) => { ok: boolean, message?: string }
+
+function openPasswordModal({ title, label = "Пароль", confirmMode = false, submitLabel = "Подтвердить", onSubmit }) {
+  passwordModalTitle.textContent = title;
+  passwordFieldLabel.textContent = label;
+  passwordFormSubmit.textContent = submitLabel;
+  passwordForm.reset();
+  passwordError.hidden = true;
+  passwordConfirmField.hidden = !confirmMode;
+  passwordConfirmInput.required = confirmMode;
+  passwordModalHandler = onSubmit;
+  passwordModalOverlay.hidden = false;
+  passwordInput.focus();
+}
+
+function closePasswordModal() {
+  passwordModalOverlay.hidden = true;
+  passwordModalHandler = null;
+}
+
+passwordModalClose.addEventListener("click", closePasswordModal);
+passwordModalOverlay.addEventListener("click", (e) => {
+  if (e.target === passwordModalOverlay) closePasswordModal();
+});
+
+passwordForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const password = passwordInput.value;
+  if (!password) return;
+
+  if (!passwordConfirmField.hidden && password !== passwordConfirmInput.value) {
+    passwordError.textContent = "Пароли не совпадают.";
+    passwordError.hidden = false;
+    return;
+  }
+
+  const handler = passwordModalHandler;
+  if (!handler) return;
+
+  passwordFormSubmit.disabled = true;
+  const result = await handler(password);
+  passwordFormSubmit.disabled = false;
+
+  if (result && result.ok) {
+    closePasswordModal();
+    renderAll();
+  } else {
+    passwordError.textContent = (result && result.message) || "Неверный пароль.";
+    passwordError.hidden = false;
+    passwordInput.value = "";
+    passwordInput.focus();
+  }
+});
 
 // --- Навигация между разделами ---
 
@@ -380,9 +636,10 @@ logoutBtn.addEventListener("click", () => {
 //
 // Файл экспорта содержит те же зашифрованные блоки, что лежат в хранилище —
 // открыть и прочитать его можно только зная тот же код доступа (им же на
-// другом устройстве будет расшифрован этот файл при импорте). Формат файла
-// не зависит от того, лежат ли данные в IndexedDB или в LocalStorage —
-// экспорт/импорт одинаково совместимы в обе стороны.
+// другом устройстве будет расшифрован этот файл при импорте). Документы и
+// файлы, защищённые отдельным паролем, остаются защищены им же и после
+// экспорта/импорта — для них помимо кода доступа архива понадобится ещё и
+// их собственный пароль.
 
 const exportBtn = document.getElementById("export-btn");
 const importBtn = document.getElementById("import-btn");
@@ -409,10 +666,13 @@ async function exportArchive() {
   URL.revokeObjectURL(url);
 }
 
-// Расшифровывает импортируемые записи текущим ключом сессии.
-// Запись, которую не получилось расшифровать (например, бэкап сделан
-// с другим кодом доступа), пропускается, а не ломает весь импорт.
-async function decryptImportedArray(rawArray) {
+// Расшифровывает импортируемые записи текущим ключом сессии. Запись,
+// защищённую индивидуальным паролем, не трогает — переносит как есть,
+// запечатанной (её при необходимости разблокируют на новом устройстве тем
+// же паролем). Запись, которую не получилось расшифровать основным ключом
+// (например, бэкап сделан с другим кодом доступа), пропускается, а не
+// ломает весь импорт.
+async function decryptImportedArray(rawArray, placeholderFields = {}) {
   const items = [];
   let failed = 0;
 
@@ -420,6 +680,11 @@ async function decryptImportedArray(rawArray) {
     try {
       if (!item.enc) {
         items.push(item);
+        continue;
+      }
+      if (item.locked) {
+        const { enc, ...meta } = item;
+        items.push({ ...meta, _lockedEnc: enc, _sealed: true, ...placeholderFields });
         continue;
       }
       const { enc, ...meta } = item;
@@ -454,8 +719,8 @@ async function importArchive(file) {
   }
 
   const [docsResult, filesResult, foldersResult] = await Promise.all([
-    decryptImportedArray(payload.documents),
-    decryptImportedArray(payload.files),
+    decryptImportedArray(payload.documents, { title: LOCKED_DOC_PLACEHOLDER_TITLE, content: "" }),
+    decryptImportedArray(payload.files, { name: LOCKED_FILE_PLACEHOLDER_NAME, dataUrl: "" }),
     decryptImportedArray(payload.folders),
   ]);
 
@@ -550,6 +815,15 @@ function getChildFolders(parentId) {
 
 function folderHasChildren(folderId) {
   return folders.some((f) => f.parentId === folderId);
+}
+
+// Прямые документы/файлы папки (не рекурсивно) — используется массовой
+// блокировкой/разблокировкой содержимого папки паролем.
+function getDirectDocsAndFiles(folderId) {
+  return {
+    docs: documents.filter((d) => d.folderId === folderId),
+    files: files.filter((f) => f.folderId === folderId),
+  };
 }
 
 // Строит плоский список всех папок с указанием глубины вложенности —
@@ -658,9 +932,99 @@ async function deleteFolder(folderId) {
   renderAll();
 }
 
+// --- Массовая блокировка/разблокировка содержимого папки паролем ---
+//
+// «Пароль на папку» — это не отдельный самостоятельный слой шифрования для
+// самой папки (её название по-прежнему шифруется общим ключом архива и
+// видно в дереве), а удобное массовое действие: одним паролем защищаются
+// (или открываются) все документы и файлы, лежащие непосредственно в этой
+// папке — тем же механизмом индивидуальной защиты, что и у одиночного
+// документа/файла (см. выше). У каждого элемента всё равно свой случайный
+// lockSalt, даже если пароль один на всех.
+
+function folderLockableCounts(folderId) {
+  const { docs, files: folderFiles } = getDirectDocsAndFiles(folderId);
+  const lockable = [...docs, ...folderFiles].filter((item) => !item.locked);
+  const sealed = [...docs, ...folderFiles].filter((item) => item.locked && item._sealed);
+  return { lockableCount: lockable.length, sealedCount: sealed.length };
+}
+
+function openLockFolderModal(folder) {
+  const { lockableCount } = folderLockableCounts(folder.id);
+  if (lockableCount === 0) {
+    alert(`В папке «${folder.name}» нет документов или файлов, которые можно защитить (без учёта вложенных папок).`);
+    return;
+  }
+
+  openPasswordModal({
+    title: `Защитить содержимое папки «${folder.name}»`,
+    label: "Новый пароль",
+    confirmMode: true,
+    submitLabel: "Защитить",
+    onSubmit: async (password) => {
+      const { docs, files: folderFiles } = getDirectDocsAndFiles(folder.id);
+      let locked = 0;
+
+      for (const doc of docs) {
+        if (doc.locked) continue;
+        await lockItemWithPassword(doc, { title: doc.title, content: doc.content }, password);
+        locked++;
+      }
+      for (const file of folderFiles) {
+        if (file.locked) continue;
+        await lockItemWithPassword(file, { name: file.name, dataUrl: file.dataUrl }, password);
+        locked++;
+      }
+
+      await Promise.all([saveDocuments(), saveFiles()]);
+      alert(`Защищено паролем: ${locked} элемент(ов) в папке «${folder.name}».`);
+      return { ok: true };
+    },
+  });
+}
+
+function openUnlockFolderModal(folder) {
+  const { sealedCount } = folderLockableCounts(folder.id);
+  if (sealedCount === 0) {
+    alert(`В папке «${folder.name}» нет запечатанных элементов для разблокировки.`);
+    return;
+  }
+
+  openPasswordModal({
+    title: `Разблокировать содержимое папки «${folder.name}»`,
+    label: "Пароль",
+    confirmMode: false,
+    submitLabel: "Открыть",
+    onSubmit: async (password) => {
+      const { docs, files: folderFiles } = getDirectDocsAndFiles(folder.id);
+      let unlocked = 0;
+      let attempted = 0;
+
+      for (const doc of docs) {
+        if (!(doc.locked && doc._sealed)) continue;
+        attempted++;
+        if (await tryUnlockItem(doc, password)) unlocked++;
+      }
+      for (const file of folderFiles) {
+        if (!(file.locked && file._sealed)) continue;
+        attempted++;
+        if (await tryUnlockItem(file, password)) unlocked++;
+      }
+
+      if (unlocked === 0) {
+        return { ok: false, message: "Неверный пароль — ни один элемент не открылся." };
+      }
+
+      alert(`Открыто паролем: ${unlocked} из ${attempted} защищённых элементов в папке «${folder.name}».`);
+      return { ok: true };
+    },
+  });
+}
+
 function renderFolderNode(folder, depth, container) {
   const hasChildren = folderHasChildren(folder.id);
   const isExpanded = expandedFolderIds.has(folder.id);
+  const { lockableCount, sealedCount } = folderLockableCounts(folder.id);
 
   const item = document.createElement("div");
   item.className = "folder-item" + (activeFolderId === folder.id ? " active" : "");
@@ -724,6 +1088,21 @@ function renderFolderNode(folder, depth, container) {
     openFolderModal({ editFolder: folder });
   });
 
+  const lockBtn = document.createElement("button");
+  lockBtn.type = "button";
+  lockBtn.className = "folder-action";
+  lockBtn.textContent = sealedCount > 0 ? "🔓" : "🔒";
+  lockBtn.title = sealedCount > 0 ? "Разблокировать содержимое папки" : "Защитить содержимое папки паролем";
+  lockBtn.setAttribute("aria-label", lockBtn.title);
+  lockBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (sealedCount > 0) {
+      openUnlockFolderModal(folder);
+    } else {
+      openLockFolderModal(folder);
+    }
+  });
+
   const deleteBtn = document.createElement("button");
   deleteBtn.type = "button";
   deleteBtn.className = "folder-action folder-delete";
@@ -737,6 +1116,7 @@ function renderFolderNode(folder, depth, container) {
 
   actions.appendChild(addSubBtn);
   actions.appendChild(renameBtn);
+  if (lockableCount > 0 || sealedCount > 0) actions.appendChild(lockBtn);
   actions.appendChild(deleteBtn);
 
   item.appendChild(name);
@@ -814,7 +1194,7 @@ function renderHome() {
 
     item.appendChild(title);
     item.appendChild(date);
-    item.addEventListener("click", () => openEditDocModal(doc));
+    item.addEventListener("click", () => openDocFromCard(doc));
 
     recentListEl.appendChild(item);
   });
@@ -844,6 +1224,86 @@ function applySort(items, sortValue, nameField, dateField) {
   return sorted;
 }
 
+// --- Черновик документа (автосохранение) ---
+//
+// Пока открыта модалка создания/редактирования документа, набранный текст
+// каждые несколько секунд сохраняется (зашифрованным основным ключом
+// архива) отдельно от самих документов. Если модалку закрыли случайно, не
+// нажав «Сохранить» (Escape, клик мимо, случайная перезагрузка), при
+// следующем открытии того же документа черновик предлагается восстановить.
+
+let draftSaveTimer = null;
+
+function scheduleDraftSave() {
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(saveDraftNow, 600);
+}
+
+async function saveDraftNow() {
+  if (docModalOverlay.hidden) return;
+  const draft = {
+    docId: editingDocId,
+    title: docTitleInput.value,
+    content: docContentInput.value,
+    savedAt: new Date().toISOString(),
+  };
+  try {
+    const enc = await encryptPayload(draft);
+    localStorage.setItem(SA_DOC_DRAFT_KEY, JSON.stringify(enc));
+  } catch (error) {
+    console.error("Не удалось сохранить черновик:", error);
+  }
+}
+
+function clearDraft() {
+  localStorage.removeItem(SA_DOC_DRAFT_KEY);
+}
+
+async function loadDraft() {
+  const raw = localStorage.getItem(SA_DOC_DRAFT_KEY);
+  if (!raw) return null;
+  try {
+    return await decryptPayload(JSON.parse(raw));
+  } catch (error) {
+    return null;
+  }
+}
+
+async function maybeOfferDraftRestore(targetDocId) {
+  const draft = await loadDraft();
+  if (!draft || draft.docId !== targetDocId) return;
+  if (!draft.title && !draft.content) return;
+
+  docDraftHint.hidden = false;
+  docDraftHint.textContent = `Найден несохранённый черновик от ${formatDateTime(draft.savedAt)}.`;
+
+  const restoreBtn = document.createElement("button");
+  restoreBtn.type = "button";
+  restoreBtn.className = "ghost-btn";
+  restoreBtn.textContent = "Восстановить";
+  restoreBtn.addEventListener("click", () => {
+    docTitleInput.value = draft.title;
+    docContentInput.value = draft.content;
+    docDraftHint.hidden = true;
+  });
+
+  const dismissBtn = document.createElement("button");
+  dismissBtn.type = "button";
+  dismissBtn.className = "ghost-btn";
+  dismissBtn.textContent = "Не нужно";
+  dismissBtn.addEventListener("click", () => {
+    clearDraft();
+    docDraftHint.hidden = true;
+  });
+
+  docDraftHint.appendChild(document.createElement("br"));
+  docDraftHint.appendChild(restoreBtn);
+  docDraftHint.appendChild(dismissBtn);
+}
+
+docTitleInput.addEventListener("input", scheduleDraftSave);
+docContentInput.addEventListener("input", scheduleDraftSave);
+
 // --- Документы ---
 
 function getFilteredDocuments() {
@@ -863,10 +1323,13 @@ function openCreateDocModal() {
   editingDocId = null;
   docModalTitle.textContent = "Новый документ";
   docForm.reset();
+  docDraftHint.hidden = true;
+  docDraftHint.innerHTML = "";
   renderFolderSelectOptions();
   if (activeFolderId) docFolderSelect.value = activeFolderId;
   docModalOverlay.hidden = false;
   docTitleInput.focus();
+  maybeOfferDraftRestore(null);
 }
 
 function openEditDocModal(doc) {
@@ -874,10 +1337,34 @@ function openEditDocModal(doc) {
   docModalTitle.textContent = "Редактировать документ";
   docTitleInput.value = doc.title;
   docContentInput.value = doc.content;
+  docDraftHint.hidden = true;
+  docDraftHint.innerHTML = "";
   renderFolderSelectOptions();
   docFolderSelect.value = doc.folderId || "";
   docModalOverlay.hidden = false;
   docTitleInput.focus();
+  maybeOfferDraftRestore(doc.id);
+}
+
+// Открывает документ из списка «Недавние» и т.п.: если он запечатан, сперва
+// просит пароль, и только потом открывает на редактирование.
+function openDocFromCard(doc) {
+  if (doc.locked && doc._sealed) {
+    openPasswordModal({
+      title: "Введи пароль документа",
+      label: "Пароль документа",
+      confirmMode: false,
+      submitLabel: "Открыть",
+      onSubmit: async (password) => {
+        const ok = await tryUnlockItem(doc, password);
+        if (!ok) return { ok: false, message: "Неверный пароль." };
+        openEditDocModal(doc);
+        return { ok: true };
+      },
+    });
+    return;
+  }
+  openEditDocModal(doc);
 }
 
 function closeDocModal() {
@@ -920,6 +1407,7 @@ docForm.addEventListener("submit", async (event) => {
   }
 
   await saveDocuments();
+  clearDraft();
   closeDocModal();
   renderAll();
 });
@@ -927,11 +1415,13 @@ docForm.addEventListener("submit", async (event) => {
 async function deleteDocument(id) {
   const doc = documents.find((d) => d.id === id);
   if (!doc) return;
-  if (!confirm(`Удалить документ «${doc.title}»? Это необратимо.`)) return;
+  const label = doc.locked && doc._sealed ? "этот защищённый документ" : `документ «${doc.title}»`;
+  if (!confirm(`Удалить ${label}? Это необратимо.`)) return;
 
   const cardEl = docsGridEl.querySelector(`[data-id="${id}"]`);
   const removeFromData = async () => {
     documents = documents.filter((d) => d.id !== id);
+    unlockedItemKeys.delete(id);
     await saveDocuments();
     renderAll();
   };
@@ -945,10 +1435,57 @@ async function deleteDocument(id) {
   }
 }
 
+// Ставит пароль на документ, который сейчас не защищён.
+function promptLockDocument(doc) {
+  openPasswordModal({
+    title: `Защитить документ «${doc.title}»`,
+    label: "Новый пароль",
+    confirmMode: true,
+    submitLabel: "Защитить",
+    onSubmit: async (password) => {
+      await lockItemWithPassword(doc, { title: doc.title, content: doc.content }, password);
+      await saveDocuments();
+      return { ok: true };
+    },
+  });
+}
+
+// Снова запечатывает документ, разблокированный в этой сессии (без удаления
+// защиты — пароль остаётся прежним, просто нужно будет ввести его заново).
+async function resealDocument(doc) {
+  const key = unlockedItemKeys.get(doc.id);
+  doc._lockedEnc = await encryptPayload({ title: doc.title, content: doc.content }, key);
+  doc.title = LOCKED_DOC_PLACEHOLDER_TITLE;
+  doc.content = "";
+  doc._sealed = true;
+  unlockedItemKeys.delete(doc.id);
+  await saveDocuments();
+  renderAll();
+}
+
+// Полностью снимает защиту с документа, разблокированного в этой сессии —
+// дальше он шифруется только основным ключом архива, как обычный документ.
+async function removeDocumentLock(doc) {
+  if (!confirm("Снять пароль с этого документа? Дальше он будет защищён только общим входом в архив.")) {
+    return;
+  }
+  delete doc.locked;
+  delete doc.lockSalt;
+  delete doc.lockCheck;
+  delete doc._lockedEnc;
+  delete doc._sealed;
+  unlockedItemKeys.delete(doc.id);
+  await saveDocuments();
+  renderAll();
+}
+
 function createDocCard(doc) {
   const card = document.createElement("div");
   card.className = "doc-card";
   card.dataset.id = doc.id;
+
+  const sealed = doc.locked && doc._sealed;
+  const unlockedNow = doc.locked && !doc._sealed;
 
   const top = document.createElement("div");
   top.className = "card-top";
@@ -960,12 +1497,50 @@ function createDocCard(doc) {
   const actions = document.createElement("div");
   actions.className = "card-actions";
 
-  const editBtn = document.createElement("button");
-  editBtn.type = "button";
-  editBtn.className = "icon-btn";
-  editBtn.textContent = "✎";
-  editBtn.setAttribute("aria-label", "Редактировать");
-  editBtn.addEventListener("click", () => openEditDocModal(doc));
+  if (sealed) {
+    const unlockBtn = document.createElement("button");
+    unlockBtn.type = "button";
+    unlockBtn.className = "icon-btn";
+    unlockBtn.textContent = "🔒";
+    unlockBtn.title = "Открыть паролем";
+    unlockBtn.setAttribute("aria-label", "Открыть документ паролем");
+    unlockBtn.addEventListener("click", () => openDocFromCard(doc));
+    actions.appendChild(unlockBtn);
+  } else {
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "icon-btn";
+    editBtn.textContent = "✎";
+    editBtn.setAttribute("aria-label", "Редактировать");
+    editBtn.addEventListener("click", () => openEditDocModal(doc));
+    actions.appendChild(editBtn);
+
+    const lockBtn = document.createElement("button");
+    lockBtn.type = "button";
+    lockBtn.className = "icon-btn";
+    lockBtn.textContent = unlockedNow ? "🔓" : "🔒";
+    lockBtn.title = unlockedNow ? "Снова запечатать" : "Защитить паролем";
+    lockBtn.setAttribute("aria-label", lockBtn.title);
+    lockBtn.addEventListener("click", () => {
+      if (unlockedNow) {
+        resealDocument(doc);
+      } else {
+        promptLockDocument(doc);
+      }
+    });
+    actions.appendChild(lockBtn);
+
+    if (unlockedNow) {
+      const removeLockBtn = document.createElement("button");
+      removeLockBtn.type = "button";
+      removeLockBtn.className = "icon-btn";
+      removeLockBtn.textContent = "⊘";
+      removeLockBtn.title = "Снять пароль совсем";
+      removeLockBtn.setAttribute("aria-label", "Снять пароль с документа");
+      removeLockBtn.addEventListener("click", () => removeDocumentLock(doc));
+      actions.appendChild(removeLockBtn);
+    }
+  }
 
   const deleteBtn = document.createElement("button");
   deleteBtn.type = "button";
@@ -973,15 +1548,14 @@ function createDocCard(doc) {
   deleteBtn.textContent = "🗑";
   deleteBtn.setAttribute("aria-label", "Удалить");
   deleteBtn.addEventListener("click", () => deleteDocument(doc.id));
-
-  actions.appendChild(editBtn);
   actions.appendChild(deleteBtn);
+
   top.appendChild(title);
   top.appendChild(actions);
 
   const snippet = document.createElement("p");
   snippet.className = "card-snippet";
-  snippet.textContent = doc.content || "Без содержания";
+  snippet.textContent = sealed ? "Содержимое защищено паролем." : doc.content || "Без содержания";
 
   const meta = document.createElement("div");
   meta.className = "card-meta";
@@ -989,16 +1563,18 @@ function createDocCard(doc) {
   dates.textContent = `Создан: ${formatDate(doc.createdAt)} · Изменён: ${formatDate(doc.updatedAt)}`;
   meta.appendChild(dates);
 
-  const folderSelect = createFolderMiniSelect(doc, async (newFolderId) => {
-    doc.folderId = newFolderId;
-    await saveDocuments();
-    renderAll();
-  });
-
   card.appendChild(top);
   card.appendChild(snippet);
   card.appendChild(meta);
-  card.appendChild(folderSelect);
+
+  if (!sealed) {
+    const folderSelect = createFolderMiniSelect(doc, async (newFolderId) => {
+      doc.folderId = newFolderId;
+      await saveDocuments();
+      renderAll();
+    });
+    card.appendChild(folderSelect);
+  }
 
   return card;
 }
@@ -1084,11 +1660,13 @@ function readFileAsDataUrl(file) {
 async function deleteFile(id) {
   const file = files.find((f) => f.id === id);
   if (!file) return;
-  if (!confirm(`Удалить файл «${file.name}»? Это необратимо.`)) return;
+  const label = file.locked && file._sealed ? "этот защищённый файл" : `файл «${file.name}»`;
+  if (!confirm(`Удалить ${label}? Это необратимо.`)) return;
 
   const cardEl = filesGridEl.querySelector(`[data-id="${id}"]`);
   const removeFromData = async () => {
     files = files.filter((f) => f.id !== id);
+    unlockedItemKeys.delete(id);
     await saveFiles();
     renderAll();
   };
@@ -1100,6 +1678,59 @@ async function deleteFile(id) {
   } else {
     await removeFromData();
   }
+}
+
+function promptLockFile(file) {
+  openPasswordModal({
+    title: `Защитить файл «${file.name}»`,
+    label: "Новый пароль",
+    confirmMode: true,
+    submitLabel: "Защитить",
+    onSubmit: async (password) => {
+      await lockItemWithPassword(file, { name: file.name, dataUrl: file.dataUrl }, password);
+      await saveFiles();
+      return { ok: true };
+    },
+  });
+}
+
+async function resealFile(file) {
+  const key = unlockedItemKeys.get(file.id);
+  file._lockedEnc = await encryptPayload({ name: file.name, dataUrl: file.dataUrl }, key);
+  file.name = LOCKED_FILE_PLACEHOLDER_NAME;
+  file.dataUrl = "";
+  file._sealed = true;
+  unlockedItemKeys.delete(file.id);
+  await saveFiles();
+  renderAll();
+}
+
+async function removeFileLock(file) {
+  if (!confirm("Снять пароль с этого файла? Дальше он будет защищён только общим входом в архив.")) {
+    return;
+  }
+  delete file.locked;
+  delete file.lockSalt;
+  delete file.lockCheck;
+  delete file._lockedEnc;
+  delete file._sealed;
+  unlockedItemKeys.delete(file.id);
+  await saveFiles();
+  renderAll();
+}
+
+function promptUnlockFile(file) {
+  openPasswordModal({
+    title: `Открыть файл «${file.name === LOCKED_FILE_PLACEHOLDER_NAME ? "защищённый файл" : file.name}»`,
+    label: "Пароль файла",
+    confirmMode: false,
+    submitLabel: "Открыть",
+    onSubmit: async (password) => {
+      const ok = await tryUnlockItem(file, password);
+      if (!ok) return { ok: false, message: "Неверный пароль." };
+      return { ok: true };
+    },
+  });
 }
 
 function canPreviewInBrowser(file) {
@@ -1115,15 +1746,55 @@ function createFileCard(file) {
   card.className = "file-card";
   card.dataset.id = file.id;
 
+  const sealed = file.locked && file._sealed;
+  const unlockedNow = file.locked && !file._sealed;
+
   const top = document.createElement("div");
   top.className = "card-top";
 
   const titleWrap = document.createElement("span");
   titleWrap.className = "card-title";
-  titleWrap.textContent = `${fileIconFor(file.mimeType, file.name)} ${file.name}`;
+  titleWrap.textContent = sealed ? file.name : `${fileIconFor(file.mimeType, file.name)} ${file.name}`;
 
   const actions = document.createElement("div");
   actions.className = "card-actions";
+
+  if (sealed) {
+    const unlockBtn = document.createElement("button");
+    unlockBtn.type = "button";
+    unlockBtn.className = "icon-btn";
+    unlockBtn.textContent = "🔒";
+    unlockBtn.title = "Открыть паролем";
+    unlockBtn.setAttribute("aria-label", "Открыть файл паролем");
+    unlockBtn.addEventListener("click", () => promptUnlockFile(file));
+    actions.appendChild(unlockBtn);
+  } else {
+    const lockBtn = document.createElement("button");
+    lockBtn.type = "button";
+    lockBtn.className = "icon-btn";
+    lockBtn.textContent = unlockedNow ? "🔓" : "🔒";
+    lockBtn.title = unlockedNow ? "Снова запечатать" : "Защитить паролем";
+    lockBtn.setAttribute("aria-label", lockBtn.title);
+    lockBtn.addEventListener("click", () => {
+      if (unlockedNow) {
+        resealFile(file);
+      } else {
+        promptLockFile(file);
+      }
+    });
+    actions.appendChild(lockBtn);
+
+    if (unlockedNow) {
+      const removeLockBtn = document.createElement("button");
+      removeLockBtn.type = "button";
+      removeLockBtn.className = "icon-btn";
+      removeLockBtn.textContent = "⊘";
+      removeLockBtn.title = "Снять пароль совсем";
+      removeLockBtn.setAttribute("aria-label", "Снять пароль с файла");
+      removeLockBtn.addEventListener("click", () => removeFileLock(file));
+      actions.appendChild(removeLockBtn);
+    }
+  }
 
   const deleteBtn = document.createElement("button");
   deleteBtn.type = "button";
@@ -1131,13 +1802,13 @@ function createFileCard(file) {
   deleteBtn.textContent = "🗑";
   deleteBtn.setAttribute("aria-label", "Удалить файл");
   deleteBtn.addEventListener("click", () => deleteFile(file.id));
-
   actions.appendChild(deleteBtn);
+
   top.appendChild(titleWrap);
   top.appendChild(actions);
   card.appendChild(top);
 
-  if (file.mimeType.startsWith("image/")) {
+  if (!sealed && file.mimeType.startsWith("image/")) {
     const img = document.createElement("img");
     img.className = "file-thumb";
     img.src = file.dataUrl;
@@ -1147,37 +1818,41 @@ function createFileCard(file) {
 
   const meta = document.createElement("div");
   meta.className = "card-meta";
-  meta.innerHTML = `<span>${formatBytes(file.size)}</span><span>${formatDate(file.createdAt)}</span>`;
+  meta.innerHTML = sealed
+    ? `<span>Защищено паролем</span><span>${formatDate(file.createdAt)}</span>`
+    : `<span>${formatBytes(file.size)}</span><span>${formatDate(file.createdAt)}</span>`;
   card.appendChild(meta);
 
-  const footer = document.createElement("div");
-  footer.className = "card-footer";
+  if (!sealed) {
+    const footer = document.createElement("div");
+    footer.className = "card-footer";
 
-  if (canPreviewInBrowser(file)) {
-    const viewBtn = document.createElement("a");
-    viewBtn.className = "ghost-btn";
-    viewBtn.href = file.dataUrl;
-    viewBtn.target = "_blank";
-    viewBtn.rel = "noopener noreferrer";
-    viewBtn.textContent = "Открыть";
-    footer.appendChild(viewBtn);
+    if (canPreviewInBrowser(file)) {
+      const viewBtn = document.createElement("a");
+      viewBtn.className = "ghost-btn";
+      viewBtn.href = file.dataUrl;
+      viewBtn.target = "_blank";
+      viewBtn.rel = "noopener noreferrer";
+      viewBtn.textContent = "Открыть";
+      footer.appendChild(viewBtn);
+    }
+
+    const downloadBtn = document.createElement("a");
+    downloadBtn.className = "ghost-btn";
+    downloadBtn.href = file.dataUrl;
+    downloadBtn.download = file.name;
+    downloadBtn.textContent = "Скачать";
+    footer.appendChild(downloadBtn);
+
+    card.appendChild(footer);
+
+    const folderSelect = createFolderMiniSelect(file, async (newFolderId) => {
+      file.folderId = newFolderId;
+      await saveFiles();
+      renderAll();
+    });
+    card.appendChild(folderSelect);
   }
-
-  const downloadBtn = document.createElement("a");
-  downloadBtn.className = "ghost-btn";
-  downloadBtn.href = file.dataUrl;
-  downloadBtn.download = file.name;
-  downloadBtn.textContent = "Скачать";
-  footer.appendChild(downloadBtn);
-
-  card.appendChild(footer);
-
-  const folderSelect = createFolderMiniSelect(file, async (newFolderId) => {
-    file.folderId = newFolderId;
-    await saveFiles();
-    renderAll();
-  });
-  card.appendChild(folderSelect);
 
   return card;
 }
@@ -1215,6 +1890,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (!docModalOverlay.hidden) closeDocModal();
   if (!folderModalOverlay.hidden) closeFolderModal();
+  if (!passwordModalOverlay.hidden) closePasswordModal();
 });
 
 // --- Инициализация: получаем ключ сессии, готовим хранилище, расшифровываем архив ---
@@ -1243,14 +1919,14 @@ async function init() {
 
   try {
     const [docsResult, filesResult, foldersResult] = await Promise.all([
-      loadEncryptedCollection("documents", SA_DOCS_KEY),
-      loadEncryptedCollection("files", SA_FILES_KEY),
-      loadEncryptedCollection("folders", SA_FOLDERS_KEY),
+      loadDocumentsFromStorage(),
+      loadFilesFromStorage(),
+      loadFoldersFromStorage(),
     ]);
 
     documents = docsResult.items;
     files = filesResult.items;
-    folders = foldersResult.items.map((f) => ({ parentId: null, ...f }));
+    folders = foldersResult.items;
 
     // Если нашлись данные в старом незашифрованном формате — сразу
     // пересохраняем их в зашифрованном виде, чтобы они больше не лежали

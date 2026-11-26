@@ -715,6 +715,33 @@ button, input, textarea, select {
   background: var(--accent-hover);
 }
 
+.save-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.draft-hint {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.draft-hint .ghost-btn {
+  margin-top: 0;
+}
+
+.password-error {
+  color: var(--danger);
+  font-size: 0.85rem;
+  margin-top: -6px;
+}
+
 .modal-close {
   position: absolute;
   top: 10px;
@@ -804,4 +831,12 @@ button, input, textarea, select {
     min-width: 0;
     padding: 14px 10px;
   }
+}
+
+/* Страховка: атрибут hidden должен побеждать любые другие display-правила
+   (без этого правила классы вроде .filter-chip/.draft-hint/.field,
+   задающие display:flex, перебивают hidden из-за равной специфичности —
+   элемент с hidden оставался видимым как пустой блок). */
+[hidden] {
+  display: none !important;
 }

@@ -169,6 +169,7 @@
           <span>Папка</span>
           <select id="doc-folder-select"></select>
         </label>
+        <p class="draft-hint" id="doc-draft-hint" hidden></p>
         <button type="submit" class="save-btn">Сохранить</button>
       </form>
     </div>
@@ -185,6 +186,26 @@
           <input type="text" id="folder-name-input" maxlength="60" required />
         </label>
         <button type="submit" class="save-btn" id="folder-form-submit">Создать</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Модалка ввода/установки пароля (документ, файл, содержимое папки) -->
+  <div class="modal-overlay" id="password-modal-overlay" hidden>
+    <div class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="password-modal-title">
+      <button type="button" class="modal-close" id="password-modal-close" aria-label="Закрыть">×</button>
+      <h2 id="password-modal-title">Пароль</h2>
+      <form id="password-form">
+        <label class="field">
+          <span id="password-field-label">Пароль</span>
+          <input type="password" id="password-input" autocomplete="off" required />
+        </label>
+        <label class="field" id="password-confirm-field" hidden>
+          <span>Повтори пароль</span>
+          <input type="password" id="password-confirm-input" autocomplete="off" />
+        </label>
+        <p class="password-error" id="password-error" hidden></p>
+        <button type="submit" class="save-btn" id="password-form-submit">Подтвердить</button>
       </form>
     </div>
   </div>
